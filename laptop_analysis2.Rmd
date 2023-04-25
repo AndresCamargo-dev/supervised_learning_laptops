@@ -1,0 +1,742 @@
+---
+title: "Laptop price analysis and predictions"
+author: "Andrés Camargo"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Motivation
+
+Technology devices are increasily demmanded. The COVID pandemic and the rise of remote work have augmented the need of laptop devices. According with The Garner, Worldwide PC shipments totaled 286.2 million units in 2022. Laptop market is really competitive, because global manufaturers spend enourmous budgets in innovation to offer better technologies, while consumers want to access to devices at reasonable prices.
+
+The objective of this project is analyze and predict laptop's prices based on their components, using supervised data science tools. Whit such analysis we can identify patterns and estimate the laptop prices with great accuracy, resulting in some benefits for manufacturers and retailers.
+
+* Better pricing strategy: With accurate price prediction models, laptop companies can devise better pricing strategies for their products. They can determine the optimal price for a particular laptop model by analyzing the components and the current market trends. This can lead to better profits and increased market share.
+
+* Competitive advantage: In a highly competitive laptop market, firms need to stay ahead of the game to maintain their position. By predicting laptop prices accurately, manufacturers can offer competitive prices that attract customers and give them an edge over their competitors.
+
+* Enhanced customer satisfaction: By understanding pattern of price drivers, companies can adjust the combination of components to offer better laptops designs and ensure that their customers are satisfied with their purchases. This can lead to increased customer loyalty and positive brand reputation.
+
+## Load Data
+
+```{r include=FALSE}
+library(tidyverse)
+library(fastDummies)
+library(DataExplorer)
+library(leaflet)
+library(MASS)
+library(caret)
+library(stringr)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+library(pROC)
+library(pdp)
+```
+
+```{r}
+laptop_raw = read.csv("laptop_price.csv")
+str(laptop_raw)
+head(laptop_raw)
+```
+
+Our original file contains around 1303 records, described in 13 variables. Later we will create more variables, generating dummies for categorical features. The variables are listed bellow, the majority are categorical. Our target variable in this project is "price_euros".
+
+- laptop_ID
+- Company
+- Product
+- TypeName
+- Inches
+- ScreenResolution
+- Cpu
+- Ram
+- Memory
+- Gpu
+- OpSys
+- Weight
+- Price_euros
+
+## Data preprocessing
+
+We applied some techniques to check the quality of the data and make the necessary transformations. We indicate what we observed and what we finally did.
+
+* The are no missing values in our dataset.
+* We extracted numeric data from variables like Screen_Resolution, Ram, Memory and Weight. Also, we trasformed as numeric type the screen_resolution and weight.
+* We grouped some categorical variables, like CPU and GPU, in the principal models.
+* We checked for other data types.
+
+```{r}
+plot_intro(laptop_raw)
+
+laptop_cl = laptop_raw %>% 
+  rename_with(tolower,everything()) %>% 
+  transmute(
+    laptop_id,
+    company,
+    product,
+    typename,
+    inches = case_when(
+      inches < 14 ~ "<14",
+      inches >=14 & inches <= 16 ~ "14-16",
+      inches >16 ~ ">16",
+    ),
+    screen_res = str_extract(screenresolution, "\\b\\d{3,4}x\\d{3,4}\\b"),
+    cpu = case_when(
+      str_detect(cpu, fixed("Intel Core i7")) ~ "Intel Core i7",
+      str_detect(cpu, fixed("Intel Core i5")) ~ "Intel Core i5",
+      str_detect(cpu, fixed("Intel Core i3")) ~ "Intel Core i3",
+      str_detect(cpu, "Intel") ~ "Intel other",
+      str_detect(cpu, fixed("AMD")) ~ "AMD",
+      TRUE ~ "other"
+    ),
+    ram = str_extract(ram, '\\d*'),
+    gpu = case_when(
+      str_detect(gpu, fixed("Intel")) ~ "Intel Graphics",
+      str_detect(gpu, fixed("Nvidia GeForce")) ~ "Nvidia GeForce",
+      str_detect(gpu, "Quadro|GTX") ~ "Nvidia Quadro/GTX",
+      str_detect(gpu, fixed("ARM")) ~ "ARM",
+      str_detect(gpu, fixed("AMD")) ~ "AMD",
+      TRUE ~ "other"),
+    op_sys = opsys,
+    weight = as.numeric(str_extract(weight, '\\d+\\.?\\d*')),
+    price_euros
+  )
+
+memory_cl = laptop_raw %>% 
+   separate(Memory, c("memorySSD", "memoryHDD"), sep = "\\+") %>% 
+   mutate(
+     memoryx = laptop_raw$Memory,
+     memorySSD = as.numeric(str_extract(memorySSD, '\\d*')),
+     memoryHDD = as.numeric(str_extract(memoryHDD, '\\d+')),
+   ) %>% 
+   mutate(
+     memorySSD= replace(memorySSD, memorySSD == 1, 1000),
+     memorySSD= replace(memorySSD, memorySSD == 2, 2000),
+     memoryHDD= replace(memoryHDD, memoryHDD == 1, 1000),
+     memoryHDD= replace(memoryHDD, memoryHDD == 2, 2000),
+     memoryHDD = replace_na(memoryHDD, 0),
+     totalmemory = memorySSD + memoryHDD
+   ) %>% 
+   dplyr::select(c(laptop_ID,totalmemory))
+
+laptop_cl = laptop_cl %>% 
+  dplyr::left_join(memory_cl, by=c("laptop_id"= "laptop_ID")) %>% 
+  mutate(
+    totalmemory = as.character(totalmemory)
+  )
+
+head(laptop_cl)
+```
+We create a dataframe for non-machine learning models. Later we will create another for this kind of algorithms.
+
+```{r}
+# convert character variables to factors
+laptop_fr = laptop_cl %>% 
+  dplyr::select(-laptop_id) %>% 
+  mutate(across(where(is.character), factor))
+  
+
+head(laptop_fr)
+```
+
+## Exploratory Analysis
+
+The variables can be broadly classified into two categories: hardware variables and software variables. Hardware variables refer to the physical components of the laptop, such as the processor, memory, storage, display, and graphics card. These variables play a crucial role in determining the performance and functionality of the laptop. For instance, the processor determines the speed at which the laptop can perform tasks, while the memory and storage determine how much data and applications can be stored and accessed. The display and graphics card determine the quality of the visual output.
+
+Software variables, on the other hand, refer to the operating system, in our case. This variables is also important in determining the functionality and usability of the laptop. The operating system determines the user interface and the compatibility of the laptop with different applications.
+
+* RAM: the boxplot of RAM versus price shows the distribution of prices for laptops with different amounts of RAM. We see that laptops with higher RAM capacity have a higher median price than laptops with lower RAM capacity.
+
+* Memory: the boxplot of memory versus price shows the distribution of prices for laptops with different storage capacities. We see that not always laptops with larger storage capacity would have a higher median price than laptops with smaller storage capacity, because the total capacity combines two technologies (HDD and SSD), and probable laptops with SSD have higher prices.
+
+* CPU/GPU: the boxplot of CPU and GPU versus price would show the distribution of prices for laptops with different processor types. We see that laptops with higher-quality processors have a higher median price than laptops with lower-quality processors.
+
+* Inches: the boxplot of inches versus price shows the distribution of prices for laptops with different screen sizes. We observe that laptops with larger screen sizes have a higher median price than laptops with smaller screen sizes.
+
+Based on the boxplots of different laptop components versus price, we can suggest that there are positive **correlations** between the predictors and the price, laptops with better components tend to have a higher price.
+
+```{r}
+
+laptop_fr %>% 
+  ggplot(aes(price_euros, fct_reorder(totalmemory, price_euros))) + geom_boxplot() +
+  ylab("Memory")
+
+laptop_fr %>% 
+  ggplot(aes(price_euros, fct_reorder(ram, price_euros))) + geom_boxplot() +
+  ylab("Ram")
+
+laptop_fr %>% 
+  ggplot(aes(price_euros, fct_reorder(cpu, price_euros))) + geom_boxplot() +
+  ylab("CPU")
+
+laptop_fr %>% 
+  ggplot(aes(price_euros, fct_reorder(gpu, price_euros))) + geom_boxplot() +
+  ylab("GPU")
+
+laptop_fr %>% 
+  ggplot(aes(price_euros, fct_reorder(inches, price_euros))) + geom_boxplot() +
+  ylab("Inches")
+
+laptop_fr %>% 
+  ggplot(aes(price_euros, fct_reorder(op_sys, price_euros))) + geom_boxplot() +
+  ylab("Operative system")
+
+laptop_fr %>% 
+  ggplot(aes(price_euros, fct_reorder(company, price_euros))) + geom_boxplot() +
+  ylab("Company")
+
+
+```
+
+Analyzing our target variable we realized that it has a right-skewed distribution, it means that the data is not symmetrically distributed around its mean, but rather has a long tail towards the right side of the distribution, with a concentration of lower values towards the left side. The implications of this is that the mean of the variable is higher than the median, and the standard deviation may not accurately reflect the spread of the data. In addition, it can cause some modeling techniques, such as linear regression, to perform poorly because it assumes that the target variable has a normal distribution.
+
+To address this issue, we will apply a log transformation to the target variable, to normalize the distribution of the target variable and make the data more symmetrical and easier to model using techniques that assume normality.
+
+```{r}
+histogram(laptop_fr$price_euros)
+boxplot(laptop_fr$price_euros)
+
+```
+
+## Regression 
+
+We built several models to predict and explain value of laptops. 
+
+### Explanatory Models (Emphasis in interpretation)
+
+Statistical models are widely used to explain and interpret variables in several fields. These models provide a framework for analyzing relationships between variables, test hypotheses, and identify important predictors. 
+
+As the demand for laptops continues to grow, the need to accurately predict their prices has also become increasingly important. Regression models are a popular method used to predict and explain prices of laptops. To start, we split data and we defined the cross validation method.
+
+#### Split data
+
+```{r}
+set.seed(163)
+
+
+# split data
+in_train <- createDataPartition(log(laptop_fr$price_euros), p = 0.75, list = FALSE)  
+training <- laptop_fr[ in_train,]
+testing <- laptop_fr[-in_train,]
+
+# ensure levels in training set
+levels(training$totalmemory) <- levels(laptop_fr$totalmemory)
+levels(training$ram) <- levels(laptop_fr$ram)
+levels(training$cpu) <- levels(laptop_fr$cpu)
+levels(training$gpu) <- levels(laptop_fr$gpu)
+levels(training$company) <- levels(laptop_fr$company)
+levels(training$typename) <- levels(laptop_fr$typename)
+levels(training$inches) <- levels(laptop_fr$inches)
+levels(training$screen_res) <- levels(laptop_fr$screen_res)
+levels(training$op_sys) <- levels(laptop_fr$op_sys)
+
+# After ensure levels of variables, we should split again. 
+in_train <- createDataPartition(log(laptop_fr$price_euros), p = 0.75, list = FALSE)  
+training <- laptop_fr[ in_train,]
+testing <- laptop_fr[-in_train,]
+
+# Create a dataframe to save predictions
+test_results <- data.frame(price_euros = log(testing$price_euros))
+```
+
+
+```{r}
+# Cross validation
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 5, repeats = 1)
+
+modelS = log(price_euros) ~ typename + inches + screen_res + cpu + ram + gpu + op_sys + weight + company
+```
+
+
+#### Linear Regression
+
+First, we compute a linear regression for predicting prices of laptops, where the relationship between the independent variables and the dependent variable (price) is assumed to be linear.
+
+```{r}
+lm_tune <- train(modelS, data = training, 
+                 method = "lm", 
+                 preProc=c('scale', 'center'),
+                 trControl = ctrl)
+
+lm_tune
+summary(lm_tune)
+```
+Looking at the output of our linear regression, we draw some conclusions. Basically, the regression model suggests that laptops with higher-end specifications tend to have a higher price, while lower-end laptops tend to have a lower price: 
+
+* typename: The type of laptop is a significant predictor of the price. The coefficients for typename variables indicate that the gaming, ultrabook, and workstation types have a positive effect on the price, whereas the notebook and netbook types have a negative effect.
+
+* inches: The screen size of a laptop is also a significant predictor of its price. Larger screens (greater than 16 inches) have a positive effect on the price, while screens between 14-16 inches have a negative effect.
+
+* screen_res: The screen resolution is another significant predictor of laptop price. Higher screen resolutions have a positive effect on the price.
+
+* cpu: The type of CPU is a significant predictor of laptop price. Intel Core i5 and i7 CPUs have a positive effect on the price, while other CPUs have a negative effect.
+
+* ram: The amount of RAM is a significant predictor of laptop price. Higher amounts of RAM have a positive effect on the price.
+
+* gpu: The type of GPU is a significant predictor of laptop price. Laptops with Nvidia Quadro/GTX and Intel Graphics have a positive effect on the price.
+
+We also observe that the linear regression has a Residual Standard Error of 0.23, which is a measure of the average difference between the predicted and actual values of the response variable. A smaller value of the Residual Standard Error indicates a better fit of the model to the data. The Multiple R-squared value of 0.86 indicates that the model explains 86% of the variability in the response variable. The Adjusted R-squared value of 0.8562 indicates that the model explains about 85% of the variability in the response variable after adjusting for the number of predictor variables in the model. The F-statistic of 105 and the corresponding p-value of less than 2.2e-16 indicate that there is a statistically significant relationship between the predictor variables and the response variable. This suggests that the predictor variables in the model are important in explaining the variability in the response variable. Then we predict, using the testing set. 
+
+__LR Visualization__
+
+We plotted the predictions versus the real values and observed that the model did not overfit the data, and the errors were symmetrically distributed. However, the model still has significant room for improvement.
+
+```{r}
+test_results = data.frame(price = log(testing$price_euros))
+test_results$lm <- predict(lm_tune, testing)
+postResample(pred = test_results$lm,  obs = test_results$price)
+
+qplot(test_results$lm, test_results$price) + 
+  labs(title="Linear Regression Observed VS Predicted", x="Predicted", y="Observed") +
+  #lims(x = c(10, 15), y = c(10, 15)) +
+  geom_abline(intercept = 0, slope = 1, colour = "blue") +
+  theme_bw()
+```
+
+#### Stepwise Regression
+
+Having a linear regression as a baseline, we can think in other alternative models that improve the interpretability of our predictions. The stepwise regression could be the better choice because it produces a final model that includes only the variables that are significant and contribute the most to the model's predictive power. Moreover, stepwise regression allows us to see the effect of each variable on the outcome and how they combine to predict the response variable.
+
+In contrast, Lasso and Ridge regression are regularization methods that aim to shrink the coefficients of the predictor variables towards zero. In this line, we will train a Stepwise regression for selecting a subset of predictors by sequentially adding or removing variables based on their statistical significance. As hyperparameters we defined a grid of maximum number of predictors between 20 and 30.
+
+```{r}
+step_tune <- train(modelS, data = training, 
+                   method = "leapSeq", 
+                   preProc=c('scale', 'center'),
+                   tuneGrid = expand.grid(nvmax = 20:30),
+                   trControl = ctrl)
+plot(step_tune)
+
+
+```
+
+We ran the stepwise regression model and we create a visualization of the tuning process. The plot shows the performance of the model at each step, with the x-axis representing the number of variables in the model and the y-axis representing the evaluation metric (such as mean squared error or R-squared). We observe that for our dataset the more number of variables the lower RMSE, indicating the better model performance. It would be because almost all of our variables are factors, then  since stepwise regression considers each variable in isolation, it may include many variables that have weak associations with the response variable. This can lead to a model that is overfitting but better for interpretation.
+
+```{r}
+coef(step_tune$finalModel, step_tune$bestTune$nvmax)
+
+```
+The stepwise regression selected a model that includes a large number of variables as predictors. The variables with the largest coefficients are cpuIntel Core i7, screen_res2560x1440, and ram4. These variables are positively or negatively associated with the log price of the laptop, suggesting that they have a strong influence on the price.
+
+
+### Prediction Models
+
+To address the challenge of anticipating laptop prices, we built some machine learning models that can accurately predict the prices of laptops based on relevant factors, including processor speed, storage capacity, screen size, and brand. This algorithms learn to identify patterns and trends in the data, and use this information to make precise predictions about the fair market value of a given laptop. 
+
+#### Spliting for ML
+
+We created a dataset called "laptop_bn", to transform categorical variables to binary variables. Categorical variables take a limited, discrete set of possible values, that do not have an inherent numerical ordering or magnitude, which can make them difficult to work with in machine learning models that require numerical inputs. To addressing this challenge, we transformed categorical variables into binary dummy variables. Moreover, we removed variables with variance close o zero, because machine learning models has issues with this kind of featrues. After that, we split in training and test datasets.
+
+
+```{r}
+# create dummy variables
+laptop_bn = laptop_cl %>% 
+  dummy_cols(select_columns = c("company","typename", "inches", "screen_res", "ram",
+            "cpu", "gpu","op_sys","weight","totalmemory")) %>% 
+  dplyr::select(!c("laptop_id", "product","company","typename", "inches", "screen_res", "ram",
+            "cpu", "gpu","op_sys","weight","totalmemory"))
+
+# remove variables with close to zero variance
+nzv <- nearZeroVar(laptop_bn, saveMetrics = TRUE)
+keep <- !(nzv$nzv | nzv$zeroVar)
+laptop_bn <- laptop_bn %>% 
+  dplyr::select(names(laptop_bn)[keep])
+
+
+# Split data
+in_train_ml <- createDataPartition(log(laptop_bn$price_euros), p = 0.75, list = FALSE)  
+training_ml <- laptop_bn[ in_train_ml,]
+testing_ml <- laptop_bn[-in_train_ml,]
+
+modelML = log(price_euros) ~ .
+
+
+# Create dataframe for ML results
+test_results_ml <- data.frame(price_euros = log(testing_ml$price_euros))
+  
+```
+
+
+#### KNN
+
+We compute a K-Nearest Neighbors (KNN) to find the K closest data points in the training set to a new data point, and using the average of their values as the predicted value for the new point. This model requires that we select a value of K, which represents the number of nearest neighbors to consider when making our prediction. We chose values between 10 and 19. 
+
+
+```{r}
+knn_tune <- train(modelML, 
+                  data = training_ml,
+                  method = "kknn",   
+                  preProc=c('scale','center'),
+                  tuneGrid = data.frame(kmax=c(10,13, 15,17,19),distance=2,kernel='optimal'),
+                  trControl = ctrl)
+plot(knn_tune)
+
+```
+We estimated some metrics about the model performance: 
+
+* RMSE (Root Mean Squared Error): a measure of the average difference between the actual and predicted values of the target variable. The lower the RMSE, the better the model's performance.
+
+* R-squared: a statistical measure that represents the proportion of the variance in the target variable that is explained by the model. It ranges from 0 to 1, with higher values indicating better model performance. 
+
+* MAE (Mean Absolute Error): It is a measure of the average absolute difference between the actual and predicted values of the target variable. It is calculated as the average of the absolute differences between the actual and predicted values. The lower the MAE, the better the model's performance.
+
+```{r}
+test_results_ml$knn <- predict(knn_tune, testing_ml)
+
+postResample(pred = test_results_ml$knn,  obs = test_results_ml$price_euros)
+
+```
+#### Random Forest
+
+Random forest combines multiple decision trees to make predictions. This model has several advantages over other machine learning algorithms. It is generally less prone to overfitting, and can provide insight into feature importance. We set the number of decision trees to be used in the Random Forest ensemble (100), and the number of features to be used in each decision tree.
+
+```{r}
+rf_tune <- train(modelML, 
+                 data = training_ml,
+                 method = "rf",
+                 preProc=c('scale','center'),
+                 trControl = ctrl,
+                 ntree = 100,
+                 tuneGrid = data.frame(mtry=c(5, 7,9,11, 13,15)),
+                 importance = TRUE)
+
+plot(rf_tune)
+```
+
+We saved the results of predictions in the dataframe and computed the random forest metrics.
+
+```{r}
+test_results_ml$rf <- predict(rf_tune, testing_ml)
+
+postResample(pred = test_results_ml$rf,  obs = test_results_ml$price_euros)
+```
+
+We plot the variable importance and partial dependence plot for a Random Forest model. In terms of importance of each variable in the model, we notice that typename_notebook has the highest importance, also the size of ram can impact the predictions. 
+
+
+```{r}
+plot(varImp(rf_tune, scale = F), scales = list(y = list(cex = .95)))
+
+```
+
+#### Gradient Boosting
+
+We also built a XGBoost, which is based on decision tree ensembles. In XGBoost, multiple decision trees are trained and combined to create an ensemble model. Each decision tree is built iteratively, with the algorithm adding new trees that correct the errors made by the previous trees. 
+
+We don't execute neither XGBoost nor NN, due to computational requirements.
+
+```{}
+xgb_tune <- train(modelML, 
+                  data = training_ml,
+                  method = "xgbTree",
+                  preProc=c('scale','center'),
+                  objective="reg:squarederror",
+                  trControl = ctrl,
+                  tuneGrid = expand.grid(nrounds = c(500,1000), max_depth = c(5,6,7), eta = c(0.01, 0.1, 1),
+                                         gamma = c(1, 2, 3), colsample_bytree = c(1, 2),
+                                         min_child_weight = c(1), subsample = c(0.2,0.5,0.8)))
+```
+
+We can see the metrics of XGboost.
+
+```{}
+test_results_ml$xgb <- predict(xgb_tune, testing_ml)
+
+postResample(pred = test_results_ml$xgb,  obs = test_results_ml$price_euros)
+
+plot(varImp(xgb_tune, scale = F), scales = list(y = list(cex = .95)))
+
+#write.csv(test_results, "models_predictions.csv")
+```
+
+
+#### Neural Networks
+
+Finally, we train a neural network, which is made up of interconnected nodes that process and transmit information. These networks can learn to recognize patterns in data by adjusting the strength of the connections between neurons. The main advantage of this kind of solution is that it can handle with complex relationships between variables. For example, a neural network can learn to recognize subtle interactions between different features of a laptop, such as the effect of processor speed on price when combined with a certain brand.
+
+
+```{}
+nn_tune <- train(modelML, 
+                 data = training_ml,
+                 method = "neuralnet",
+                 preProc=c('scale','center'),
+                 trControl = ctrl,
+                 tuneGrid = expand.grid(layer1 = c(4, 2),
+                                        layer2 = c(2, 1, 0),
+                                        layer3 = c(0)))
+
+test_results_ml$nn <- predict(nn_tune, testing_ml)
+
+postResample(pred = test_results_ml$nn,  obs = test_results_ml$price_euros)
+
+plot(varImp(nn_tune, scale = F), scales = list(y = list(cex = .95)))
+
+```
+
+
+### Model Ensamble
+
+In order to get better results, we apply model ensembling, wich involves combining multiple models to improve the overall accuracy and robustness of a prediction. We compare the MAE of each model, but we don't want to select between them. Additionally, we estimate the average of the result using the predictions of our models.
+
+```{r}
+apply(test_results_ml[-1], 2, function(x) mean(abs(x - test_results_ml$price_euros)))
+
+test_results_ml$comb = (test_results_ml$knn + test_results_ml$rf)/2
+
+postResample(pred = test_results_ml$comb,  obs = test_results_ml$price_euros)
+```
+
+#### Predictions
+
+We estimate the exponential of the ensambled predictions and plot their distribution.
+
+```{r}
+yhat = exp(test_results_ml$comb)
+
+head(yhat)
+hist(yhat, col="lightblue")
+```
+
+__Prediction intervals__
+
+Estimating prediction intervals is crucial because it allows for a more accurate assessment of the uncertainty around a predicted value. In our case, there may be significant variability in the data due to factors such as brand, processor speed, storage, and graphics card.
+
+```{r}
+y = exp(test_results_ml$price)
+error = y-yhat
+
+#show the distribution of errors
+hist(error, col="lightblue")
+
+#compute prediction intervals
+noise = error[1:100]
+lwr = yhat[101:length(yhat)] + quantile(noise,0.05, na.rm=T)
+upr = yhat[101:length(yhat)] + quantile(noise,0.95, na.rm=T)
+
+
+predictions = data.frame(real=y[101:length(y)], fit=yhat[101:length(yhat)], lwr=lwr, upr=upr)
+
+predictions = predictions %>% mutate(out=factor(if_else(real<lwr | real>upr,1,0)))
+
+# how many real observations are out of the intervals?
+mean(predictions$out==1)
+
+# plot the preductions and PI
+
+ggplot(predictions, aes(x=fit, y=real))+
+  geom_point(aes(color=out)) + theme(legend.position="none") +
+  geom_ribbon(data=predictions,aes(ymin=lwr,ymax=upr),alpha=0.3) +
+  labs(title = "Prediction intervals", x = "prediction",y="real price")
+```
+
+Our model ensamble gives important information about laptop prices. If a laptop is predicted to be priced higher than its actual value, it could indicate that the device include some special components, and the company can improve its price strategy to increment the product value. Moreover, it could also reflect a market situation where there is low demand, and the company try to reduce the value of the product. On the other hand, laptops above to the prediction interval could have higher demand. 
+
+### Regression Conclussions
+
+* We found that our dataset seems to reflect a linear relation between predictors and the target variable.
+* Along the different models we can identify that the most significant variables and those with higher contribution to prediction, because they were present in the results of our alternatives.
+* Since the dataset includes many categorical variables, it generates some problems of zero variance for unique characteristics, because where factors are converted to binary variables, the majority of the observations are zero.
+
+## Classification
+
+On the second part of our project we want to build some classification models, to predict if a laptop belong to a premium class or if doesn't. Classification models are powerful tools for companies to make data-driven decisions and improve their business operations. In the case of laptops, predicting whether a laptop belongs to a premium class or not can help companies optimize their sales and marketing strategies, and better understand the most impacting components.
+
+First we created the target categories. We defined that laptops with a price higher than the 3 quantile of price distribution as "premium". After that, we split the dataset in train and testing sections.
+
+```{r}
+limit = quantile(laptop_fr$price_euros, 0.75)
+
+laptop_prm = laptop_fr %>% 
+  mutate(
+    premium = as.factor(ifelse(price_euros > limit, 1,0))
+  ) %>% 
+  dplyr::select(!price_euros)
+
+head(laptop_prm)
+
+```
+
+
+```{r}
+# split data
+in_train_prm <- createDataPartition(laptop_prm$premium, p = 0.75, list = FALSE)  
+training_prm <- laptop_prm[ in_train_prm,]
+testing_prm <- laptop_prm[-in_train_prm,]
+
+# ensure categories in training set
+levels(training_prm$totalmemory) <- levels(laptop_prm$totalmemory)
+levels(training_prm$ram) <- levels(laptop_prm$ram)
+levels(training_prm$cpu) <- levels(laptop_prm$cpu)
+levels(training_prm$gpu) <- levels(laptop_prm$gpu)
+levels(training_prm$company) <- levels(laptop_prm$company)
+levels(training_prm$typename) <- levels(laptop_prm$typename)
+levels(training_prm$inches) <- levels(laptop_prm$inches)
+levels(training_prm$screen_res) <- levels(laptop_prm$screen_res)
+levels(training_prm$op_sys) <- levels(laptop_prm$op_sys)
+
+# split again to keep category levels in training set
+in_train_prm <- createDataPartition(laptop_prm$premium, p = 0.75, list = FALSE)  
+training_prm <- laptop_prm[ in_train_prm,]
+testing_prm <- laptop_prm[-in_train_prm,]
+
+table(testing_prm$premium)
+```
+
+#### Logistic Regression
+
+First, we train a logistic model to predict the probability of a new laptop belonging to the premium class based on its specifications. One of the main advantages of logistic regression is its ability to model non-linear relationships between the predictor variables and the binary response variable. This model can also handle categorical predictor variables, which is appropriate for our dataset, making it a versatile tool. 
+
+```{r}
+
+# train model
+m_logistic <- glm(premium ~ typename + ram + op_sys + ram + gpu, data = training_prm, family = binomial)
+summary(m_logistic)
+
+```
+
+Based on the output, the most significant variables for predicting premium laptops are "typenameNotebook", "ram16", "ram32", "ram4", and "gpuIntel Graphics". The coefficient for "typenameNotebook" is negative, which suggests that Notebooks are less likely to be premium than the reference category. The coefficients for "ram16" and "ram32" are positive, indicating that laptops with 16GB and 32GB of RAM are more likely to be premium, respectively. The coefficient for "gpuIntel Graphics" are positive, suggesting that laptops with these features are more likely to be premium.
+
+The confusion matrix indicates that the model successfully identifies classes, but it has a higher number of false negatives than false positives. In other words, the model is more likely to miss positive cases than to incorrectly identify negative cases. As a result, the sensitivity of the model is higher than its specificity. Given our objective of running a marketing campaign that targets the majority of premium laptops, our priority will be to reduce the number of false negatives. This will ensure that we are not missing out on potential customers who might be interested in our product.
+
+```{r}
+# estimate probability and compute metrics
+probability_log = predict(m_logistic, newdata=testing_prm, type="response")
+prediction_log = as.factor(ifelse(probability_log > 0.5, 1,0))
+
+confusionMatrix(prediction_log, testing_prm$premium)
+
+```
+
+### LDA
+
+Second, we use a Linear Discriminant Analysis (LDA) model, which finds a linear combination of predictors that maximally separates the classes in the data. In our case, it can find a linear combination of features (such as processor speed, graphics card, RAM, operating system, etc.) that best separates premium laptops from non-premium laptop. First, we trained the model, then we calculated the performance metrics.
+
+```{r}
+m_lda = lda(premium ~ typename + ram + op_sys + ram + gpu, data=training_prm)
+m_lda
+```
+
+We observed that the performance is really close to a logistic regression.
+
+```{r}
+prediction_lda = predict(m_lda, newdata=testing_prm)$class
+head(prediction_lda)
+confusionMatrix(prediction_lda, testing_prm$premium)
+```
+
+
+### KNN
+
+We will try some machine learning algorithms to improve our metrics. KNN is a simple algorithm that is easy to implement and understand. It does not require complex assumptions about the data, and can be easily adapted to different types of classification problems.
+
+```{r}
+ctrl_knn <- trainControl(method = "repeatedcv", 
+                     number = 10,
+                     classProbs = TRUE, 
+                     summaryFunction=twoClassSummary, 
+                     verboseIter = T)
+
+levels(training_prm$premium) =c("No","Yes")
+levels(testing_prm$premium)=c("No","Yes")
+```
+
+
+```{r}
+knnFit <- train(premium ~ typename + ram + op_sys + ram + gpu, 
+                  data = training_prm,
+                  method = "kknn",   
+                  preProc=c('scale','center'),
+                  tuneLength = 10, 
+                  metric="ROC",
+                  trControl = ctrl_knn)
+plot(knnFit)
+
+knnProb = predict(knnFit, testing_prm, type="prob")
+prediction_knn <- as.factor(ifelse(knnProb[,2] > 0.1, "Yes", "No"))
+
+confusionMatrix(prediction_knn, testing_prm$premium)
+
+#AUC
+roc(testing_prm$premium, knnProb[,2])$auc
+```
+The accuracy of the model and sensitivity keeps high; however we don't get great differences in performance.
+
+
+### Decision Tree
+
+We train a decision tree model for identifying premium laptops, which analyzes the input features of each laptop, and split sequentially the data on each node.
+
+```{r}
+m_decisiont <- train(premium ~ typename + ram + op_sys + ram + gpu, 
+                   data = training_prm, 
+                   method = "rpart", 
+                   control=rpart.control(minsplit = 8, maxdepth = 12),
+                   trControl = trainControl(method = "cv", number = 5),
+                   tuneLength=10)
+m_decisiont
+rpart.plot(m_decisiont$finalModel)
+
+```
+This algorithm reduces dramatically the number of false negatives, however the number of false positives is too much high.
+
+```{r}
+dtProb <- predict(m_decisiont, testing_prm, type = "prob")
+
+prediction_dt_prm <- as.factor(ifelse(dtProb[,2] > 0.1, "Yes", "No"))
+
+confusionMatrix(prediction_dt_prm, testing_prm$premium)
+
+#AUC
+roc(testing_prm$premium, dtProb[,2])$auc
+
+```
+
+### Random Forest
+
+Finally we trained a random forest classifier, based on its high accuracy, robustness, and scalability.
+
+```{r}
+ctrl_rf <- trainControl(method = "repeatedcv", 
+                     number = 10, 
+                     classProbs = T, 
+                     summaryFunction=twoClassSummary, 
+                     verboseIter = T)
+
+rfFit_prm <- train(premium ~ typename + ram + op_sys + ram + gpu, 
+                  data = training_prm,
+                  method = "rf", 
+                  preProc=c('scale','center'),
+                  tuneLength = 10,
+                  metric="ROC",
+                  trControl = ctrl_rf)
+
+
+plot(rfFit_prm)
+
+rfProb_prm = predict(rfFit_prm, testing_prm, type="prob")
+prediction_rf_prm <- as.factor(ifelse(rfProb_prm[,2] > 0.1, "Yes", "No"))
+
+confusionMatrix(prediction_rf_prm, testing_prm$premium)
+
+#AUC
+roc(testing_prm$premium, rfProb_prm[,2])$auc
+
+```
+The output of this model indicates that it is helpful for identifying premium laptops, spatially, the number of true positives is really high. In addition, the AUC of the model is above 0.9, suggesting that the random forest model is a good classifier for identifying premium laptops. 
+
+### Clasification Conclusions
+
+* After train several models to accomplish our goal, we notice that each model contribute differently to the classification process.
+
+* The basic logistic regression is really straightforward in terms of interpretability and prediction, achieving high performance metrics and results.
+
+* For our purposes, we would rather use the random forest alternative, because we want to achieve a lower false negative rate.
+
